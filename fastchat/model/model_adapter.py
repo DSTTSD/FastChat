@@ -29,6 +29,8 @@ from fastchat.model.monkey_patch_non_inplace import (
     replace_llama_attn_with_non_inplace_operations,
 )
 from fastchat.utils import get_gpu_memory
+from transformers.utils.quantization_config import BitsAndBytesConfig
+# import tensor_parallel as tp
 
 
 class BaseAdapter:
@@ -37,11 +39,29 @@ class BaseAdapter:
     def match(self, model_path: str):
         return True
 
-    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+    def load_guanaco(self, model_path: str, from_pretrained_kwargs: dict):
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, low_cpu_mem_usage=True, **from_pretrained_kwargs
-        )
+        model_path, #  model_name_or_path=
+        load_in_4bit=True,
+        device_map='auto',
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        # max_memory=from_pretrained_kwargs['max_gpu_memory'],
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type='nf4'
+        ),
+    )
+        return model, tokenizer
+    
+    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, low_cpu_mem_usage=True, trust_remote_code=True, **from_pretrained_kwargs
+        )# low_cpu_mem_usage=True,
         return model, tokenizer
 
     def get_default_conv_template(self, model_path: str) -> Conversation:
@@ -155,10 +175,18 @@ def load_model(
 
     # Load model
     adapter = get_model_adapter(model_path)
-    model, tokenizer = adapter.load_model(model_path, kwargs)
+    if 'guanaco' in model_path:
+        model, tokenizer = adapter.load_guanaco(model_path, kwargs)
+    else:
+        model, tokenizer = adapter.load_model(model_path, kwargs)
 
     if (device == "cuda" and num_gpus == 1 and not cpu_offloading) or device == "mps":
         model.to(device)
+    
+    # elif num_gpus > 1:
+    #     model = model.half()
+    #     gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
+    #     model = tp.tensor_parallel(model, gpu_list)
 
     if debug:
         print(model)

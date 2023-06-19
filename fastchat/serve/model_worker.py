@@ -79,9 +79,18 @@ class ModelWorker:
         self.device = device
 
         logger.info(f"Loading the model {self.model_name} on worker {worker_id} ...")
-        self.model, self.tokenizer = load_model(
-            model_path, device, num_gpus, max_gpu_memory, load_8bit, cpu_offloading
-        )
+        TENSOR_PARALELL = True
+        if TENSOR_PARALELL:
+            import tensor_parallel as tp
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True )
+            self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, low_cpu_mem_usage=True).half()  # use opt-125m for testing
+            self.model.eval()
+            #self.model = self.model.to(device)
+            self.model = tp.tensor_parallel(self.model, [f"cuda:{int(num)}" for num in range(num_gpus)])
+        else:
+            self.model, self.tokenizer = load_model(
+                model_path, device, num_gpus, max_gpu_memory, load_8bit, cpu_offloading
+            )
         if self.tokenizer.pad_token == None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
