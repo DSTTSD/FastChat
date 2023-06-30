@@ -334,7 +334,122 @@ class ModelWorker:
                 "error_code": ErrorCode.INTERNAL_ERROR,
             }
         return ret
+    
+    @torch.inference_mode()
+    def sentence_energy_plus(self, prefix, suffix, repetition_penalty=1.0):
+        """
+        incoporate the repitation penalty
+        """
+        tokenizer = self.tokenizer
+        model = self.model
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
+        
+        input_tokens = prefix_tokens + suffix_tokens
+        input_tokens = torch.tensor([input_tokens]).to(model.device)
+        with torch.no_grad():
+            outputs = model(input_tokens)
+            logits = outputs.logits
+        for i, token in enumerate(prefix_tokens):
+            if token in suffix_tokens:
+                logits[0, i, token] /= repetition_penalty
+        log_likelihood = torch.mean(torch.gather(logits, 2, input_tokens.unsqueeze(2)).squeeze(2))
+        energy = -log_likelihood
+        print(f"penalty:{repetition_penalty};  energy:{energy.item()}")
+        return energy.item()
 
+    @torch.inference_mode()
+    def conditional_sentence_energy(self, prefix, suffix):
+        """
+        E(Z| theta)
+        """
+        tokenizer = self.tokenizer
+        model = self.model
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False, return_tensors='pt')
+        suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False, return_tensors='pt')
+        prefix_tokens = prefix_tokens.to(model.device)
+        suffix_tokens = suffix_tokens.to(model.device)
+        input_tokens = torch.cat((prefix_tokens, suffix_tokens), dim=1)
+        with torch.no_grad():
+            outputs = model(input_tokens)
+            logits = outputs.logits[0, -len(suffix_tokens):, :]
+            log_probabilities = torch.log_softmax(logits, dim=-1)
+            suffix_probability = log_probabilities[torch.arange(len(suffix_tokens)), suffix_tokens.squeeze()]
+            energy = -suffix_probability.mean()
+        # print("conditional energy:", energy)
+        return energy.item()
+
+    # Function to score a sentence
+    @torch.inference_mode()
+    def sentence_energy(self, text):
+        """
+        E(theta, Z)
+        """
+        tokenizer = self.tokenizer
+        model = self.model
+
+        inputs = tokenizer.encode_plus(text, return_tensors="pt")
+        input_ids = inputs.input_ids.to(model.device)
+        attention_mask = inputs.attention_mask.to(model.device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+            # retrieves the logits from the model's output.(except the last one)
+            logits = outputs.logits[:, :-1, :].contiguous()
+            #  extracts the labels from the input IDs. 
+            labels = input_ids[:, 1:].contiguous()
+            # compute the log probabilities of the tokens
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            # select the log probability of the labels
+            log_prob_mean = torch.gather(log_probs, dim=-1,index=labels.unsqueeze(-1)).squeeze(-1).mean(dim=1) # 
+        energy = -log_prob_mean.mean().item()
+        print("energy:", energy)
+        return energy
+    
+    @torch.inference_mode()
+    def conditional_sentence_score(self, prefix, suffix):
+        """
+        E(Z| theta)
+        """
+        tokenizer = self.tokenizer
+        model = self.model
+
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False, return_tensors='pt')
+        suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False, return_tensors='pt')
+        prefix_tokens = prefix_tokens.to(model.device)
+        suffix_tokens = suffix_tokens.to(model.device)
+        input_tokens = torch.cat((prefix_tokens, suffix_tokens), dim=1)
+        with torch.no_grad():
+            outputs = model(input_tokens)
+            logits = outputs.logits[0, -len(suffix_tokens):, :]
+            log_probabilities = torch.log_softmax(logits, dim=-1)
+            suffix_probability = log_probabilities[torch.arange(len(suffix_tokens)), suffix_tokens.squeeze()]   
+        return suffix_probability.mean().item()
+
+    @torch.inference_mode()
+    def score_sentence(self, text):
+        """
+        E(theta, Z)
+        """
+        tokenizer = self.tokenizer
+        model = self.model
+
+        inputs = tokenizer.encode_plus(text, return_tensors="pt")
+        input_ids = inputs.input_ids.to(model.device)
+        attention_mask = inputs.attention_mask.to(model.device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+            # retrieves the logits from the model's output.(except the last one)
+            logits = outputs.logits[:, :-1, :].contiguous()
+            #  extracts the labels from the input IDs. 
+            labels = input_ids[:, 1:].contiguous()
+            # compute the log probabilities of the tokens
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            # select the log probability of the labels
+            log_prob_mean = torch.gather(log_probs, dim=-1,index=labels.unsqueeze(-1)).squeeze(-1).mean(dim=1) # 
+        score = log_prob_mean.mean().item()
+        return score
 
 app = FastAPI()
 
@@ -422,6 +537,41 @@ async def api_get_conv(request: Request):
 async def model_details(request: Request):
     return {"context_length": worker.context_len}
 
+# my energy part
+@app.post('/conditional_energy')
+async def conditional_sentence_energy_interface(data: dict):
+    prefix = data['prefix']
+    suffix = data['suffix']
+    energy = worker.conditional_sentence_energy(prefix, suffix)
+    print("conditional energy:", energy)
+    return {'energy': energy}
+
+@app.post('/energy')
+async def sentence_energy_interface(data: dict):
+    text = data['text']
+    energy = worker.sentence_energy(text)
+    return {'energy': energy}
+
+@app.post('/score')
+async def score_sentence_interface(data: dict):
+    text = data['text']
+    score = worker.score_sentence(text)
+    return {'score': score}
+
+@app.post('/conditional_score')
+async def conditional_score_sentence_interface(data: dict):
+    prefix = data['prefix']
+    suffix = data['suffix']
+    score = worker.conditional_sentence_score(prefix, suffix)
+    return {'score': score}
+
+@app.post('/energy_plus')
+async def sentence_energy_plus_interface(data: dict):
+    prefix = data['prefix']
+    suffix = data['suffix']
+    repitition_penalty = data['repetition_penalty']
+    energy = worker.sentence_energy_plus(prefix, suffix, repitition_penalty)
+    return {'energy': energy}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

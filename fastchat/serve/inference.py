@@ -73,6 +73,7 @@ def generate_stream(
 
     input_ids = tokenizer(prompt).input_ids
     output_ids = list(input_ids)
+    logprobs = [] # 1 adding logprobs
 
     if model.config.is_encoder_decoder:
         max_src_len = context_len
@@ -150,6 +151,10 @@ def generate_stream(
             stopped = True
         else:
             stopped = False
+        
+        # Compute log probability of the generated token
+        log_prob = float(torch.log_softmax(last_token_logits, dim=-1)[token])
+        logprobs.append(log_prob)
 
         if i % stream_interval == 0 or i == max_new_tokens - 1 or stopped:
             if echo:
@@ -198,6 +203,7 @@ def generate_stream(
                         "total_tokens": input_echo_len + i,
                     },
                     "finish_reason": None,
+                    "logprobs": logprobs,
                 }
 
         if stopped:
@@ -219,6 +225,7 @@ def generate_stream(
             "total_tokens": input_echo_len + i,
         },
         "finish_reason": finish_reason,
+        "logprobs": logprobs,
     }
 
     # clean
