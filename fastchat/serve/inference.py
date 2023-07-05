@@ -220,7 +220,6 @@ def generate_stream(
             "total_tokens": input_echo_len + i,
         },
         "finish_reason": finish_reason,
-        "logprobs": logprobs,
     }
 
     # clean

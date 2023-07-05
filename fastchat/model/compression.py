@@ -131,7 +131,7 @@ def load_compress_model(
     compressed_state_dict = {}
 
     for filename in tqdm(files):
-        tmp_state_dict = torch.load(filename)
+        tmp_state_dict = torch.load(filename) if torch.cuda.device_count() > 1 else torch.load(filename, map_location=torch.device('cpu'))
         for name in tmp_state_dict:
             if name in linear_weights:
                 tensor = tmp_state_dict[name].to(device).data.to(torch_dtype)
