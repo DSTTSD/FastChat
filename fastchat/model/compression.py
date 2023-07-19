@@ -114,8 +114,9 @@ def load_compress_model(
             low_cpu_mem_usage=True,
             torch_dtype=torch_dtype,
             revision=revision,
+            trust_remote_code=True
         )
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         linear_weights = get_compressed_list(model)
 
     if os.path.exists(model_path):

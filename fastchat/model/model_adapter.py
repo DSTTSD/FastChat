@@ -200,15 +200,15 @@ def load_model(
     if (device == "cuda" and num_gpus == 1 and not cpu_offloading) or device == "mps":
         adapter = get_model_adapter(model_path)
         model, tokenizer = adapter.load_model(model_path, kwargs)
-        # model.to(device)
-        import deepspeed
-        model = deepspeed.init_inference(
-            model=model,      # Transformers models
-            mp_size=num_gpus,        # Number of GPU
-            dtype=torch.float16, # dtype of the weights (fp16)
-            replace_method="auto", # Lets DS autmatically identify the layer to replace
-            replace_with_kernel_inject=True, # replace the model with the kernel injector
-        )
+        model.to(device)
+        # import deepspeed
+        # model = deepspeed.init_inference(
+        #     model=model,      # Transformers models
+        #     mp_size=num_gpus,        # Number of GPU
+        #     dtype=torch.float16, # dtype of the weights (fp16)
+        #     replace_method="auto", # Lets DS autmatically identify the layer to replace
+        #     replace_with_kernel_inject=True, # replace the model with the kernel injector
+        # )
 
     elif device == "xpu":
         adapter = get_model_adapter(model_path)

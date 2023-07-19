@@ -56,6 +56,7 @@ def generate_stream(
     model, tokenizer, params, device, context_len=2048, stream_interval=2
 ):
     prompt = params["prompt"]
+    print("This is a prompt: ", prompt)
     len_prompt = len(prompt)
     temperature = float(params.get("temperature", 1.0))
     repetition_penalty = float(params.get("repetition_penalty", 1.0))
