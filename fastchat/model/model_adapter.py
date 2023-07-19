@@ -218,12 +218,13 @@ def load_model(
         model = torch.xpu.optimize(model, dtype=torch.bfloat16, inplace=True)
 
     elif num_gpus != 1:
-        is_deep_speed = True
+        is_deep_speed = False # TODO: still not support deepspeed
         if is_deep_speed:
             import deepspeed
             kwargs = {"torch_dtype": torch.float32}
             adapter = get_model_adapter(model_path)
             model, tokenizer = adapter.load_model(model_path, kwargs)
+            
             model = deepspeed.init_inference(
                 model=model,      # Transformers models
                 mp_size=num_gpus,        # Number of GPU
