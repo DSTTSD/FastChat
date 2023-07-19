@@ -1,157 +1,87 @@
 """
-A model worker executes the model based on vLLM.
+A model worker that executes the model based on vLLM.
 
-This is an experimental feature and will be documented soon. Please stay tuned!
-
-Install vLLM (``pip install vllm'') first. Then, assuming the controller is live:
-1. python3 -m fastchat.serve.vllm_worker --model-path lmsys/vicuna-7b-v1.3
-
-launch Gradio:
-2. python3 -m fastchat.serve.gradio_web_server --concurrency-count 10000
+See documentations at docs/vllm_integration.md
 """
-import threading
 
 import argparse
 import asyncio
 import json
-import time
-import uuid
+from typing import List
 
-import requests
+from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse
 import torch
 import uvicorn
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse
-
-from fastchat.constants import WORKER_HEART_BEAT_INTERVAL
-from fastchat.utils import build_logger, pretty_print_semaphore
 from vllm import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
-
-GB = 1 << 30
-TIMEOUT_TO_PREVENT_DEADLOCK = 1  # seconds
-
-worker_id = str(uuid.uuid4())[:6]
-logger = build_logger("model_worker", f"model_worker_{worker_id}.log")
-global_counter = 0
-seed = torch.cuda.current_device()
+from fastchat.serve.model_worker import (
+    BaseModelWorker,
+    logger,
+    worker_id,
+)
+from fastchat.utils import get_context_length
 
 
-def heart_beat_worker(controller):
-    while True:
-        time.sleep(WORKER_HEART_BEAT_INTERVAL)
-        controller.send_heart_beat()
+app = FastAPI()
 
 
-class VLLMWorker:
+class VLLMWorker(BaseModelWorker):
     def __init__(
         self,
-        controller_addr,
-        worker_addr,
-        worker_id,
-        no_register,
-        model_path,
-        model_name,
+        controller_addr: str,
+        worker_addr: str,
+        worker_id: str,
+        model_path: str,
+        model_names: List[str],
+        limit_worker_concurrency: int,
+        no_register: bool,
+        llm_engine: AsyncLLMEngine,
     ):
-        self.controller_addr = controller_addr
-        self.worker_addr = worker_addr
-        self.worker_id = worker_id
-        if model_path.endswith("/"):
-            model_path = model_path[:-1]
-        self.model_name = model_name or model_path.split("/")[-1]
-        logger.info(
-            f"Loading the model {self.model_name} on worker {worker_id}, worker type: vLLM worker..."
+        super().__init__(
+            controller_addr,
+            worker_addr,
+            worker_id,
+            model_path,
+            model_names,
+            limit_worker_concurrency,
         )
+
+        logger.info(
+            f"Loading the model {self.model_names} on worker {worker_id}, worker type: vLLM worker..."
+        )
+        self.tokenizer = llm_engine.engine.tokenizer
+        self.context_len = get_context_length(llm_engine.engine.model_config.hf_config)
 
         if not no_register:
-            self.register_to_controller()
-            self.heart_beat_thread = threading.Thread(
-                target=heart_beat_worker, args=(self,)
-            )
-            self.heart_beat_thread.start()
-
-    def register_to_controller(self):
-        logger.info("Register to controller")
-
-        url = self.controller_addr + "/register_worker"
-        data = {
-            "worker_name": self.worker_addr,
-            "check_heart_beat": True,
-            "worker_status": self.get_status(),
-        }
-        r = requests.post(url, json=data)
-        assert r.status_code == 200
-
-    def send_heart_beat(self):
-        logger.info(
-            f"Send heart beat. Models: {[self.model_name]}. "
-            f"Semaphore: {pretty_print_semaphore(model_semaphore)}. "
-            f"global_counter: {global_counter}. "
-            f"worker_id: {worker_id}. "
-        )
-
-        url = self.controller_addr + "/receive_heart_beat"
-
-        while True:
-            try:
-                ret = requests.post(
-                    url,
-                    json={
-                        "worker_name": self.worker_addr,
-                        "queue_length": self.get_queue_length(),
-                    },
-                    timeout=5,
-                )
-                exist = ret.json()["exist"]
-                break
-            except requests.exceptions.RequestException as e:
-                logger.error(f"heart beat error: {e}")
-            time.sleep(5)
-
-        if not exist:
-            self.register_to_controller()
-
-    def get_queue_length(self):
-        if (
-            model_semaphore is None
-            or model_semaphore._value is None
-            or model_semaphore._waiters is None
-        ):
-            return 0
-        else:
-            return (
-                args.limit_model_concurrency
-                - model_semaphore._value
-                + len(model_semaphore._waiters)
-            )
-
-    def get_status(self):
-        return {
-            "model_names": [self.model_name],
-            "speed": 1,
-            "queue_length": self.get_queue_length(),
-        }
+            self.init_heart_beat()
 
     async def generate_stream(self, params):
+        self.call_ct += 1
+
         context = params.pop("prompt")
         request_id = params.pop("request_id")
         temperature = float(params.get("temperature", 1.0))
         top_p = float(params.get("top_p", 1.0))
-        max_new_tokens = min(int(params.get("max_new_tokens", 256)), 1024)
+        max_new_tokens = params.get("max_new_tokens", 256)
         stop_str = params.get("stop", None)
+        stop_token_ids = params.get("stop_token_ids", None) or []
+        stop_token_ids.append(self.tokenizer.eos_token_id)
         echo = params.get("echo", True)
 
         # Handle stop_str
-        if stop_str is None:
-            stop_str = []
+        if isinstance(stop_str, str) and stop_str != "":
+            stop = [stop_str]
+        elif isinstance(stop_str, list) and stop_str != []:
+            stop = stop_str
+        else:
+            stop = []
 
-        # TODO(Hao): handle stop token IDs
-        # stop_token_ids = params.get("stop_token_ids", None) or []
-        # max_src_len = self.context_len - max_new_tokens - 8
-        # input_ids = input_ids[-max_src_len:]
+        for tid in stop_token_ids:
+            stop.append(self.tokenizer.decode(tid))
 
         # make sampling params in vllm
         top_p = max(top_p, 1e-5)
@@ -162,7 +92,7 @@ class VLLMWorker:
             temperature=temperature,
             top_p=top_p,
             use_beam_search=False,
-            stop=stop_str,
+            stop=stop,
             max_tokens=max_new_tokens,
         )
         results_generator = engine.generate(context, sampling_params, request_id)
@@ -176,43 +106,78 @@ class VLLMWorker:
             else:
                 text_outputs = [output.text for output in request_output.outputs]
             text_outputs = " ".join(text_outputs)
-            ret = {"text": text_outputs, "error_code": 0}
-            yield (json.dumps(ret) + "\0").encode("utf-8")
+            # Note: usage is not supported yet
+            ret = {"text": text_outputs, "error_code": 0, "usage": {}}
+            yield (json.dumps(ret) + "\0").encode()
+
+    async def generate(self, params):
+        async for x in self.generate_stream(params):
+            pass
+        return json.loads(x[:-1].decode())
 
 
-app = FastAPI()
-model_semaphore = None
+def release_worker_semaphore():
+    worker.semaphore.release()
 
 
-def release_model_semaphore():
-    model_semaphore.release()
+def acquire_worker_semaphore():
+    if worker.semaphore is None:
+        worker.semaphore = asyncio.Semaphore(worker.limit_worker_concurrency)
+    return worker.semaphore.acquire()
 
 
-@app.post("/worker_generate_stream")
-async def generate_stream(request: Request):
-    global model_semaphore, global_counter
-    global_counter += 1
-    request_id = random_uuid()
-    params = await request.json()
-    params["request_id"] = request_id
-
+def create_background_tasks(request_id):
     async def abort_request() -> None:
         await engine.abort(request_id)
 
-    if model_semaphore is None:
-        model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
-    await model_semaphore.acquire()
     background_tasks = BackgroundTasks()
-    background_tasks.add_task(release_model_semaphore)
+    background_tasks.add_task(release_worker_semaphore)
     background_tasks.add_task(abort_request)
-    return StreamingResponse(
-        worker.generate_stream(params), background=background_tasks
-    )
+    return background_tasks
+
+
+@app.post("/worker_generate_stream")
+async def api_generate_stream(request: Request):
+    params = await request.json()
+    await acquire_worker_semaphore()
+    request_id = random_uuid()
+    params["request_id"] = request_id
+    generator = worker.generate_stream(params)
+    background_tasks = create_background_tasks(request_id)
+    return StreamingResponse(generator, background=background_tasks)
+
+
+@app.post("/worker_generate")
+async def api_generate(request: Request):
+    params = await request.json()
+    await acquire_worker_semaphore()
+    request_id = random_uuid()
+    params["request_id"] = request_id
+    output = await worker.generate(params)
+    release_worker_semaphore()
+    await engine.abort(request_id)
+    return JSONResponse(output)
 
 
 @app.post("/worker_get_status")
-async def get_status(request: Request):
+async def api_get_status(request: Request):
     return worker.get_status()
+
+
+@app.post("/count_token")
+async def api_count_token(request: Request):
+    params = await request.json()
+    return worker.count_token(params)
+
+
+@app.post("/worker_get_conv_template")
+async def api_get_conv(request: Request):
+    return worker.get_conv_template()
+
+
+@app.post("/model_details")
+async def api_model_details(request: Request):
+    return {"context_length": worker.context_len}
 
 
 if __name__ == "__main__":
@@ -224,7 +189,12 @@ if __name__ == "__main__":
         "--controller-address", type=str, default="http://localhost:21001"
     )
     parser.add_argument("--model-path", type=str, default="lmsys/vicuna-7b-v1.3")
-    parser.add_argument("--limit-model-concurrency", type=int, default=1024)
+    parser.add_argument(
+        "--model-names",
+        type=lambda s: s.split(","),
+        help="Optional display comma separated names",
+    )
+    parser.add_argument("--limit-worker-concurrency", type=int, default=1024)
     parser.add_argument("--no-register", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=1)
 
@@ -234,18 +204,17 @@ if __name__ == "__main__":
         args.model = args.model_path
     if args.num_gpus > 1:
         args.tensor_parallel_size = args.num_gpus
-    model_name = args.model_path
-    if "/" in args.model_path:
-        model_name = args.model_path.split("/")[-1]
 
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
     worker = VLLMWorker(
         args.controller_address,
         args.worker_address,
         worker_id,
-        args.no_register,
         args.model_path,
-        model_name,
+        args.model_names,
+        args.limit_worker_concurrency,
+        args.no_register,
+        engine,
     )
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
